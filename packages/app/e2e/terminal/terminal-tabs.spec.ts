@@ -27,6 +27,8 @@ async function run(page: Page, cmd: string) {
   await terminal.click()
   await page.keyboard.type(cmd)
   await page.keyboard.press("Enter")
+  // powershell + windows just isnt that fast... we need to wait
+  await page.waitForTimeout(3_000)
 }
 
 async function store(page: Page, key: string) {
