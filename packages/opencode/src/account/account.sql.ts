@@ -1,7 +1,23 @@
-import { sqliteTable, text, integer, primaryKey, uniqueIndex } from "drizzle-orm/sqlite-core"
-import { eq } from "drizzle-orm"
+import { sqliteTable, text, integer, primaryKey } from "drizzle-orm/sqlite-core"
 import { Timestamps } from "@/storage/schema.sql"
 
+export const AccountTable = sqliteTable("account", {
+  id: text().primaryKey(),
+  email: text().notNull(),
+  url: text().notNull(),
+  access_token: text().notNull(),
+  refresh_token: text().notNull(),
+  token_expiry: integer(),
+  selected_org_id: text(),
+  ...Timestamps,
+})
+
+export const AccountStateTable = sqliteTable("account_state", {
+  id: integer().primaryKey(),
+  active_account_id: text().references(() => AccountTable.id, { onDelete: "set null" }),
+})
+
+// LEGACY
 export const ControlAccountTable = sqliteTable(
   "control_account",
   {

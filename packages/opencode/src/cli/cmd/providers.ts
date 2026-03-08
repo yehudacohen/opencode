@@ -13,27 +13,13 @@ import { Instance } from "../../project/instance"
 import type { Hooks } from "@opencode-ai/plugin"
 import { Process } from "../../util/process"
 import { text } from "node:stream/consumers"
-import { setTimeout as sleep } from "node:timers/promises"
 
 type PluginAuth = NonNullable<Hooks["auth"]>
 
-/**
- * Handle plugin-based authentication flow.
- * Returns true if auth was handled, false if it should fall through to default handling.
- */
-async function handlePluginAuth(plugin: { auth: PluginAuth }, provider: string, methodName?: string): Promise<boolean> {
+async function handlePluginAuth(plugin: { auth: PluginAuth }, provider: string): Promise<boolean> {
   let index = 0
-  if (methodName) {
-    const match = plugin.auth.methods.findIndex((x) => x.label.toLowerCase() === methodName.toLowerCase())
-    if (match === -1) {
-      prompts.log.error(
-        `Unknown method "${methodName}" for ${provider}. Available: ${plugin.auth.methods.map((x) => x.label).join(", ")}`,
-      )
-      process.exit(1)
-    }
-    index = match
-  } else if (plugin.auth.methods.length > 1) {
-    const selected = await prompts.select({
+  if (plugin.auth.methods.length > 1) {
+    const method = await prompts.select({
       message: "Login method",
       options: [
         ...plugin.auth.methods.map((x, index) => ({
@@ -42,13 +28,12 @@ async function handlePluginAuth(plugin: { auth: PluginAuth }, provider: string, 
         })),
       ],
     })
-    if (prompts.isCancel(selected)) throw new UI.CancelledError()
-    index = parseInt(selected)
+    if (prompts.isCancel(method)) throw new UI.CancelledError()
+    index = parseInt(method)
   }
   const method = plugin.auth.methods[index]
 
-  // Handle prompts for all auth types
-  await sleep(10)
+  await Bun.sleep(10)
   const inputs: Record<string, string> = {}
   if (method.prompts) {
     for (const prompt of method.prompts) {
@@ -171,11 +156,6 @@ async function handlePluginAuth(plugin: { auth: PluginAuth }, provider: string, 
   return false
 }
 
-/**
- * Build a deduplicated list of plugin-registered auth providers that are not
- * already present in models.dev, respecting enabled/disabled provider lists.
- * Pure function with no side effects; safe to test without mocking.
- */
 export function resolvePluginProviders(input: {
   hooks: Hooks[]
   existingProviders: Record<string, unknown>
@@ -203,19 +183,20 @@ export function resolvePluginProviders(input: {
   return result
 }
 
-export const AuthCommand = cmd({
-  command: "auth",
-  describe: "manage credentials",
+export const ProvidersCommand = cmd({
+  command: "providers",
+  aliases: ["auth"],
+  describe: "manage AI providers and credentials",
   builder: (yargs) =>
-    yargs.command(AuthLoginCommand).command(AuthLogoutCommand).command(AuthListCommand).demandCommand(),
+    yargs.command(ProvidersListCommand).command(ProvidersLoginCommand).command(ProvidersLogoutCommand).demandCommand(),
   async handler() {},
 })
 
-export const AuthListCommand = cmd({
+export const ProvidersListCommand = cmd({
   command: "list",
   aliases: ["ls"],
-  describe: "list providers",
-  async handler() {
+  describe: "list providers and credentials",
+  async handler(_args) {
     UI.empty()
     const authPath = path.join(Global.Path.data, "auth.json")
     const homedir = os.homedir()
@@ -231,7 +212,6 @@ export const AuthListCommand = cmd({
 
     prompts.outro(`${results.length} credentials`)
 
-    // Environment variables section
     const activeEnvVars: Array<{ provider: string; envVar: string }> = []
 
     for (const [providerID, provider] of Object.entries(database)) {
@@ -258,25 +238,14 @@ export const AuthListCommand = cmd({
   },
 })
 
-export const AuthLoginCommand = cmd({
+export const ProvidersLoginCommand = cmd({
   command: "login [url]",
   describe: "log in to a provider",
   builder: (yargs) =>
-    yargs
-      .positional("url", {
-        describe: "opencode auth provider",
-        type: "string",
-      })
-      .option("provider", {
-        alias: ["p"],
-        describe: "provider id or name to log in to (skips provider selection)",
-        type: "string",
-      })
-      .option("method", {
-        alias: ["m"],
-        describe: "login method label (skips method selection)",
-        type: "string",
-      }),
+    yargs.positional("url", {
+      describe: "opencode auth provider",
+      type: "string",
+    }),
   async handler(args) {
     await Instance.provide({
       directory: process.cwd(),
@@ -284,8 +253,7 @@ export const AuthLoginCommand = cmd({
         UI.empty()
         prompts.intro("Add credential")
         if (args.url) {
-          const url = args.url.replace(/\/+$/, "")
-          const wellknown = await fetch(`${url}/.well-known/opencode`).then((x) => x.json() as any)
+          const wellknown = await fetch(`${args.url}/.well-known/opencode`).then((x) => x.json() as any)
           prompts.log.info(`Running \`${wellknown.auth.command.join(" ")}\``)
           const proc = Process.spawn(wellknown.auth.command, {
             stdout: "pipe",
@@ -301,12 +269,12 @@ export const AuthLoginCommand = cmd({
             prompts.outro("Done")
             return
           }
-          await Auth.set(url, {
+          await Auth.set(args.url, {
             type: "wellknown",
             key: wellknown.auth.env,
             token: token.trim(),
           })
-          prompts.log.success("Logged into " + url)
+          prompts.log.success("Logged into " + args.url)
           prompts.outro("Done")
           return
         }
@@ -343,76 +311,59 @@ export const AuthLoginCommand = cmd({
           enabled,
           providerNames: Object.fromEntries(Object.entries(config.provider ?? {}).map(([id, p]) => [id, p.name])),
         })
-        const options = [
-          ...pipe(
-            providers,
-            values(),
-            sortBy(
-              (x) => priority[x.id] ?? 99,
-              (x) => x.name ?? x.id,
+        let provider = await prompts.autocomplete({
+          message: "Select provider",
+          maxItems: 8,
+          options: [
+            ...pipe(
+              providers,
+              values(),
+              sortBy(
+                (x) => priority[x.id] ?? 99,
+                (x) => x.name ?? x.id,
+              ),
+              map((x) => ({
+                label: x.name,
+                value: x.id,
+                hint: {
+                  opencode: "recommended",
+                  anthropic: "Claude Max or API key",
+                  openai: "ChatGPT Plus/Pro or API key",
+                }[x.id],
+              })),
             ),
-            map((x) => ({
+            ...pluginProviders.map((x) => ({
               label: x.name,
               value: x.id,
-              hint: {
-                opencode: "recommended",
-                anthropic: "Claude Max or API key",
-                openai: "ChatGPT Plus/Pro or API key",
-              }[x.id],
+              hint: "plugin",
             })),
-          ),
-          ...pluginProviders.map((x) => ({
-            label: x.name,
-            value: x.id,
-            hint: "plugin",
-          })),
-        ]
+            {
+              value: "other",
+              label: "Other",
+            },
+          ],
+        })
 
-        let provider: string
-        if (args.provider) {
-          const input = args.provider
-          const byID = options.find((x) => x.value === input)
-          const byName = options.find((x) => x.label.toLowerCase() === input.toLowerCase())
-          const match = byID ?? byName
-          if (!match) {
-            prompts.log.error(`Unknown provider "${input}"`)
-            process.exit(1)
-          }
-          provider = match.value
-        } else {
-          const selected = await prompts.autocomplete({
-            message: "Select provider",
-            maxItems: 8,
-            options: [
-              ...options,
-              {
-                value: "other",
-                label: "Other",
-              },
-            ],
-          })
-          if (prompts.isCancel(selected)) throw new UI.CancelledError()
-          provider = selected as string
-        }
+        if (prompts.isCancel(provider)) throw new UI.CancelledError()
 
         const plugin = await Plugin.list().then((x) => x.findLast((x) => x.auth?.provider === provider))
         if (plugin && plugin.auth) {
-          const handled = await handlePluginAuth({ auth: plugin.auth }, provider, args.method)
+          const handled = await handlePluginAuth({ auth: plugin.auth }, provider)
           if (handled) return
         }
 
         if (provider === "other") {
-          const custom = await prompts.text({
+          provider = await prompts.text({
             message: "Enter provider id",
             validate: (x) => (x && x.match(/^[0-9a-z-]+$/) ? undefined : "a-z, 0-9 and hyphens only"),
           })
-          if (prompts.isCancel(custom)) throw new UI.CancelledError()
-          provider = custom.replace(/^@ai-sdk\//, "")
+          if (prompts.isCancel(provider)) throw new UI.CancelledError()
+          provider = provider.replace(/^@ai-sdk\//, "")
+          if (prompts.isCancel(provider)) throw new UI.CancelledError()
 
-          // Check if a plugin provides auth for this custom provider
           const customPlugin = await Plugin.list().then((x) => x.findLast((x) => x.auth?.provider === provider))
           if (customPlugin && customPlugin.auth) {
-            const handled = await handlePluginAuth({ auth: customPlugin.auth }, provider, args.method)
+            const handled = await handlePluginAuth({ auth: customPlugin.auth }, provider)
             if (handled) return
           }
 
@@ -461,10 +412,10 @@ export const AuthLoginCommand = cmd({
   },
 })
 
-export const AuthLogoutCommand = cmd({
+export const ProvidersLogoutCommand = cmd({
   command: "logout",
   describe: "log out from a configured provider",
-  async handler() {
+  async handler(_args) {
     UI.empty()
     const credentials = await Auth.all().then((x) => Object.entries(x))
     prompts.intro("Remove credential")
